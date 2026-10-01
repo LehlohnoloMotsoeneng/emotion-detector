@@ -35,9 +35,11 @@ def emotion_endpoint():
         return jsonify({"error": "Please provide text to analyze."}), 400
 
     result = emotion_detector(payload)
-    if "error" in result:
+    if result.get("error") == "Please provide text to analyze.":
         return jsonify(result), 400
-    return jsonify(result)
+    if result.get("error"):
+        return jsonify(result), 503
+    return jsonify(result), 200
 
 
 if __name__ == "__main__":

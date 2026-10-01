@@ -1,92 +1,86 @@
-"""Emotion detection helpers using IBM Watson Natural Language Understanding."""
+"""Emotion detection using the Skills Network Watson NLP EmotionPredict service."""
 
 from __future__ import annotations
 
-import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-try:
-    from ibm_cloud_sdk_core.api_exception import ApiException
-    from ibm_cloud_sdk_core.authenticators import IAMAuthenticator
-    from ibm_watson import NaturalLanguageUnderstandingV1
-    from ibm_watson.natural_language_understanding_v1 import (
-        EmotionOptions,
-        Features,
-    )
-except ImportError:  # pragma: no cover - handled at runtime when dependency is absent
-    ApiException = None
-    IAMAuthenticator = None
-    NaturalLanguageUnderstandingV1 = None
-    EmotionOptions = None
-    Features = None
+import requests
 
 
+WATSON_URL = (
+    "https://sn-watson-emotion.labs.skills.network/"
+    "v1/watson.runtime.nlp.v1/NlpService/EmotionPredict"
+)
+WATSON_MODEL_ID = "emotion_aggregated-workflow_lang_en_stock"
 EMOTION_KEYS = ("anger", "disgust", "fear", "joy", "sadness")
 
 
-def _get_watson_client() -> Optional[Any]:
-    """Create and configure an IBM Watson NLU client when credentials exist."""
-    if NaturalLanguageUnderstandingV1 is None or IAMAuthenticator is None:
-        return None
+def _extract_emotion_scores(payload: Any) -> Dict[str, float]:
+    """Read emotion scores from the Watson EmotionPredict response."""
+    if isinstance(payload, list):
+        if not payload:
+            raise ValueError("Missing Watson emotion predictions")
+        return _extract_emotion_scores(payload[0])
 
-    api_key = os.getenv("WATSON_API_KEY") or os.getenv("API_KEY")
-    service_url = os.getenv("WATSON_URL") or os.getenv("URL")
-    if not api_key or not service_url:
-        return None
+    if not isinstance(payload, dict):
+        raise ValueError("Unexpected Watson emotion response")
 
-    authenticator = IAMAuthenticator(api_key)
-    client = NaturalLanguageUnderstandingV1(
-        authenticator=authenticator,
-        version="2022-04-07",
-    )
-    client.set_service_url(service_url)
-    return client
+    if "emotionPredictions" in payload:
+        return _extract_emotion_scores(payload["emotionPredictions"])
 
+    for key in ("emotion", "emotion_prediction", "prediction"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            scores = {
+                emotion_key: float(value[emotion_key])
+                for emotion_key in EMOTION_KEYS
+                if emotion_key in value
+            }
+            if scores:
+                return scores
 
-def _fallback_emotion_scores(text: str) -> Dict[str, Any]:
-    """Provide a deterministic fallback score set when Watson is unavailable."""
-    lowered = text.lower()
+    if any(key in payload for key in EMOTION_KEYS):
+        scores = {
+            emotion_key: float(payload[emotion_key])
+            for emotion_key in EMOTION_KEYS
+            if emotion_key in payload
+        }
+        if scores:
+            return scores
 
-    if any(word in lowered for word in ("happy", "joy", "love", "excited", "great", "good")):
-        scores = {"anger": 0.02, "disgust": 0.01, "fear": 0.01, "joy": 0.93, "sadness": 0.03}
-    elif any(word in lowered for word in ("sad", "cry", "hurt", "upset", "bad", "lonely")):
-        scores = {"anger": 0.08, "disgust": 0.03, "fear": 0.07, "joy": 0.08, "sadness": 0.74}
-    elif any(word in lowered for word in ("angry", "mad", "furious", "rage", "hate")):
-        scores = {"anger": 0.91, "disgust": 0.04, "fear": 0.02, "joy": 0.01, "sadness": 0.02}
-    elif any(word in lowered for word in ("afraid", "scared", "fear", "panic", "nervous")):
-        scores = {"anger": 0.03, "disgust": 0.02, "fear": 0.88, "joy": 0.01, "sadness": 0.06}
-    elif any(word in lowered for word in ("disgust", "gross", "nasty", "repulsive", "revolting")):
-        scores = {"anger": 0.10, "disgust": 0.82, "fear": 0.03, "joy": 0.02, "sadness": 0.03}
-    else:
-        scores = {"anger": 0.15, "disgust": 0.12, "fear": 0.18, "joy": 0.30, "sadness": 0.25}
-
-    dominant_emotion = max(scores, key=scores.get)
-    return {**scores, "dominant_emotion": dominant_emotion}
+    raise ValueError("Watson emotion data not found in response")
 
 
 def emotion_detector(text_to_analyse: Any) -> Dict[str, Any]:
-    """Analyze text for emotions using IBM Watson NLU or a local fallback."""
+    """Send valid text to the Watson NLP EmotionPredict endpoint."""
     if text_to_analyse is None or not str(text_to_analyse).strip():
         return {"error": "Please provide text to analyze."}
 
     text = str(text_to_analyse).strip()
-    client = _get_watson_client()
-
-    if client is None:
-        return _fallback_emotion_scores(text)
+    headers = {"grpc-metadata-mm-model-id": WATSON_MODEL_ID}
+    payload = {"raw_document": {"text": text}}
 
     try:
-        response = client.analyze(
-            text=text,
-            features=Features(emotion=EmotionOptions()),
+        response = requests.post(
+            WATSON_URL,
+            json=payload,
+            headers=headers,
+            timeout=30,
         )
-        result = response.get_result()
-        emotion_data = result.get("emotion", {}).get("document", {}).get("emotion", {})
-        scores = {key: float(emotion_data.get(key, 0.0)) for key in EMOTION_KEYS}
-        scores["dominant_emotion"] = max(scores, key=scores.get)
-        return scores
-    except (ApiException, AttributeError, TypeError, ValueError) as exc:
-        error_text = str(exc).lower()
-        if "400" in error_text or "invalid" in error_text or "empty" in error_text:
-            return {"error": "Please provide valid text to analyze."}
-        return _fallback_emotion_scores(text)
+        response.raise_for_status()
+        response_payload = response.json()
+        scores = _extract_emotion_scores(response_payload)
+    except requests.RequestException:
+        return {"error": "Watson NLP service is unavailable."}
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return {"error": "Invalid response from Watson NLP service."}
+
+    normalized_scores = {
+        emotion_key: float(scores.get(emotion_key, 0.0))
+        for emotion_key in EMOTION_KEYS
+    }
+    normalized_scores["dominant_emotion"] = max(
+        normalized_scores,
+        key=normalized_scores.get,
+    )
+    return normalized_scores
